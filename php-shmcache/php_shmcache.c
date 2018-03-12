@@ -41,7 +41,7 @@ static struct shmcache_context *shmcache_get_context(const char *filename,
         char *error_info, const int error_size);
 
 #if PHP_MAJOR_VERSION < 7
-#define shmcache_get_object(obj) zend_object_store_get_object(obj)
+#define shmcache_get_object(obj) zend_object_store_get_object(obj TSRMLS_CC)
 #else
 #define shmcache_get_object(obj) (void *)((char *)(Z_OBJ_P(obj)) - XtOffsetOf(php_shmcache_t, zo))
 #endif
@@ -80,7 +80,7 @@ zend_module_entry shmcache_module_entry = {
 	NULL,//PHP_RINIT(shmcache),
 	NULL,//PHP_RSHUTDOWN(shmcache),
 	PHP_MINFO(shmcache),
-	"1.0.1",
+	"1.0.5",
 	STANDARD_MODULE_PROPERTIES
 };
 
@@ -240,6 +240,86 @@ static PHP_METHOD(ShmCache, set)
     RETURN_TRUE;
 }
 
+/* boolean ShmCache::setExpires(string key, long expires)
+ * return true for success, false for fail
+ */
+static PHP_METHOD(ShmCache, setExpires)
+{
+	zval *object;
+	php_shmcache_t *i_obj;
+    struct shmcache_key_info key;
+    char *key_str;
+    zend_size_t key_len;
+    long expires;
+    int result;
+
+    object = getThis();
+	i_obj = (php_shmcache_t *) shmcache_get_object(object);
+
+	if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "sl",
+			&key_str, &key_len, &expires) == FAILURE)
+	{
+		logError("file: "__FILE__", line: %d, "
+			"zend_parse_parameters fail!", __LINE__);
+		RETURN_FALSE;
+	}
+
+    key.data = key_str;
+    key.length = key_len;
+    result = shmcache_set_expires(i_obj->context, &key, expires);
+    if (result == 0) {
+        RETURN_TRUE;
+    } else {
+        if (result == EINVAL) {
+            logError("file: "__FILE__", line: %d, "
+                    "expires: %ld is invalid!", __LINE__, expires);
+            zend_throw_exception(shmcache_exception_ce,
+                    "invalid expires parameter", 0 TSRMLS_CC);
+        }
+		RETURN_FALSE;
+    }
+}
+
+/* boolean ShmCache::setTTL(string key, long ttl)
+ * return true for success, false for fail
+ */
+static PHP_METHOD(ShmCache, setTTL)
+{
+	zval *object;
+	php_shmcache_t *i_obj;
+    struct shmcache_key_info key;
+    char *key_str;
+    zend_size_t key_len;
+    long ttl;
+    int result;
+
+    object = getThis();
+	i_obj = (php_shmcache_t *) shmcache_get_object(object);
+
+	if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "sl",
+			&key_str, &key_len, &ttl) == FAILURE)
+	{
+		logError("file: "__FILE__", line: %d, "
+			"zend_parse_parameters fail!", __LINE__);
+		RETURN_FALSE;
+	}
+
+    key.data = key_str;
+    key.length = key_len;
+    result = shmcache_set_ttl(i_obj->context, &key, ttl);
+    if (result == 0) {
+        RETURN_TRUE;
+    } else {
+        if (result == EINVAL) {
+            logError("file: "__FILE__", line: %d, "
+                    "ttl: %ld is invalid!", __LINE__, ttl);
+            zend_throw_exception(shmcache_exception_ce,
+                    "invalid ttl parameter", 0 TSRMLS_CC);
+        }
+		RETURN_FALSE;
+    }
+}
+
 /* long ShmCache::incr(string key, long increment, long ttl)
  * return the value after increase, false for fail
  */
@@ -348,7 +428,7 @@ static PHP_METHOD(ShmCache, getExpires)
 
     returnExpired = false;
 	if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "s|b",
-			&key_str, &key_len) == FAILURE)
+			&key_str, &key_len, &returnExpired) == FAILURE)
 	{
 		logError("file: "__FILE__", line: %d, "
 			"zend_parse_parameters fail!", __LINE__);
@@ -396,7 +476,7 @@ static PHP_METHOD(ShmCache, delete)
     RETURN_TRUE;
 }
 
-/* array ShmCache::stats()
+/* array ShmCache::stats([bool calc_hit_ratio = true])
  * return stats array
  */
 static PHP_METHOD(ShmCache, stats)
@@ -409,11 +489,21 @@ static PHP_METHOD(ShmCache, stats)
     zval *used_detail;
     zval *recycle;
     zval *lock;
+    zend_bool calc_hit_ratio;
 
     object = getThis();
 	i_obj = (php_shmcache_t *) shmcache_get_object(object);
 
-    shmcache_stats(i_obj->context, &stats);
+    calc_hit_ratio = true;
+	if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "|b",
+			&calc_hit_ratio) == FAILURE)
+	{
+		logError("file: "__FILE__", line: %d, "
+			"zend_parse_parameters fail!", __LINE__);
+		RETURN_FALSE;
+	}
+
+    shmcache_stats_ex(i_obj->context, &stats, calc_hit_ratio);
     array_init(return_value);
 
     {
@@ -446,6 +536,20 @@ static PHP_METHOD(ShmCache, stats)
     zend_add_assoc_long_ex(hashtable, "last_clear_time",
             sizeof("last_clear_time"),
             stats.shm.hashtable.last_clear_time);
+    zend_add_assoc_double_ex(hashtable, "get.qps",
+            sizeof("get.qps"), stats.hit.get_qps);
+    if (stats.hit.ratio >= 0.00) {
+        char hit_ratio[32];
+        int ratio_len;
+        ratio_len = sprintf(hit_ratio, "%.2f%%", stats.hit.ratio * 100.00);
+        zend_add_assoc_stringl_ex(hashtable, "hit.ratio",
+                sizeof("hit.ratio"), hit_ratio, ratio_len, 1);
+    } else {
+        zend_add_assoc_stringl_ex(hashtable, "hit.ratio",
+                sizeof("hit.ratio"), "-", 1, 1);
+    }
+    zend_add_assoc_long_ex(hashtable, "hit.last_seconds",
+            sizeof("hit.last_seconds"), stats.hit.seconds);
     }
 
     {
@@ -553,6 +657,16 @@ ZEND_ARG_INFO(0, value)
 ZEND_ARG_INFO(0, ttl)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_INFO_EX(arginfo_setExpires, 0, 0, 2)
+ZEND_ARG_INFO(0, key)
+ZEND_ARG_INFO(0, expires)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_setTTL, 0, 0, 2)
+ZEND_ARG_INFO(0, key)
+ZEND_ARG_INFO(0, ttl)
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_INFO_EX(arginfo_incr, 0, 0, 3)
 ZEND_ARG_INFO(0, key)
 ZEND_ARG_INFO(0, increment)
@@ -583,6 +697,8 @@ ZEND_END_ARG_INFO()
 static zend_function_entry shmcache_class_methods[] = {
     SHMC_ME(__construct,  arginfo___construct)
     SHMC_ME(set,          arginfo_set)
+    SHMC_ME(setExpires,   arginfo_setExpires)
+    SHMC_ME(setTTL,       arginfo_setTTL)
     SHMC_ME(incr,         arginfo_incr)
     SHMC_ME(get,          arginfo_get)
     SHMC_ME(getExpires,   arginfo_getExpires)

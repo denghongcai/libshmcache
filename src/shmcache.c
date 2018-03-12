@@ -24,11 +24,10 @@
 //HT for HashTable, VA for Value Allocator
 #define OFFSETS_INDEX_HT_BUCKETS            0
 #define OFFSETS_INDEX_HT_POOL_QUEUE         1
-#define OFFSETS_INDEX_HT_POOL_OBJECT        2
-#define OFFSETS_INDEX_VA_POOL_QUEUE_DOING   3
-#define OFFSETS_INDEX_VA_POOL_QUEUE_DONE    4
-#define OFFSETS_INDEX_VA_POOL_OBJECT        5
-#define OFFSETS_COUNT                       6
+#define OFFSETS_INDEX_VA_POOL_QUEUE_DOING   2
+#define OFFSETS_INDEX_VA_POOL_QUEUE_DONE    3
+#define OFFSETS_INDEX_VA_POOL_OBJECT        4
+#define OFFSETS_COUNT                       5
 
 #define SHM_HASH_TABLE_PROJ_ID      1
 
@@ -111,10 +110,6 @@ static int64_t shmcache_get_ht_segment_size(struct shmcache_context *context,
     total_size += shm_object_pool_get_queue_memory_size(
             context->config.max_key_count + 1);
 
-    ht_offsets[OFFSETS_INDEX_HT_POOL_OBJECT] = total_size;
-    total_size += shm_object_pool_get_object_memory_size(
-            sizeof(struct shm_hash_entry), context->config.max_key_count);
-
     va_pool_queue_memory_size = shm_object_pool_get_queue_memory_size(
             striping->count.max + 1);
 
@@ -163,14 +158,6 @@ static int shmcache_do_init(struct shmcache_context *context,
     }
 
     queue_base = (int64_t *)(context->segments.hashtable.base +
-            ht_offsets[OFFSETS_INDEX_HT_POOL_QUEUE]);
-    shmcache_set_object_pool_context(&context->hentry_allocator,
-            &context->memory->hentry_obj_pool,
-            sizeof(struct shm_hash_entry),
-            ht_offsets[OFFSETS_INDEX_HT_POOL_OBJECT],
-            context->config.max_key_count + 1, queue_base, true);
-
-    queue_base = (int64_t *)(context->segments.hashtable.base +
             ht_offsets[OFFSETS_INDEX_VA_POOL_QUEUE_DOING]);
     shmcache_set_object_pool_context(&context->value_allocator.doing,
             &context->memory->value_allocator.doing,
@@ -211,15 +198,15 @@ static int shmcache_do_lock_init(struct shmcache_context *context,
         context->memory->vm_info.striping = *striping;
 
         shm_ht_init(context, ht_capacity);
-        shm_list_init(&context->list);
+        shm_list_init(context);
         if ((result=shmcache_do_init(context, ht_offsets)) != 0) {
             break;
         }
 
+        context->memory->init_time = context->memory->stats.init_time =
+            context->memory->stats.last.calc_time = get_current_time();
         context->memory->usage.alloced = context->segments.hashtable.size;
-        context->memory->usage.used.common = context->segments.hashtable.size -
-            shm_object_pool_get_object_memory_size(sizeof(struct shm_hash_entry),
-                    context->config.max_key_count);
+        context->memory->usage.used.common = context->segments.hashtable.size;
         if ((result=shmopt_create_value_segment(context)) != 0) {
             break;
         }
@@ -241,11 +228,6 @@ static void shmcache_set_obj_allocators(struct shmcache_context *context,
         const int64_t *ht_offsets)
 {
     int64_t *queue_base;
-
-    queue_base = (int64_t *)(context->segments.hashtable.base +
-            ht_offsets[OFFSETS_INDEX_HT_POOL_QUEUE]);
-    shm_object_pool_set(&context->hentry_allocator,
-            &context->memory->hentry_obj_pool, queue_base);
 
     queue_base = (int64_t *)(context->segments.hashtable.base +
             ht_offsets[OFFSETS_INDEX_VA_POOL_QUEUE_DOING]);
@@ -418,7 +400,7 @@ int shmcache_init(struct shmcache_context *context,
     memset(context->segments.values.items, 0, bytes);
 
     context->memory = (struct shm_memory_info *)context->segments.hashtable.base;
-    shm_list_set(&context->list, context->segments.hashtable.base,
+    shm_list_set(context, context->segments.hashtable.base,
             &context->memory->hashtable.head);
     shmcache_set_obj_allocators(context, ht_offsets);
     if (ht_segemnt_exists && check_segment &&
@@ -436,6 +418,25 @@ int shmcache_init(struct shmcache_context *context,
             }
         }
         result = shmopt_open_value_segments(context);
+        if (result == 0 && context->memory->vm_info.segment.count.current <
+                context->memory->vm_info.segment.count.max)
+        {
+            shm_lock(context);
+            while (context->segments.hashtable.size +
+                context->memory->vm_info.segment.size *
+                context->memory->vm_info.segment.count.current < config->min_memory)
+            {
+                if ((result=shmopt_create_value_segment(context)) != 0) {
+                    break;
+                }
+                if (context->memory->vm_info.segment.count.current >=
+                        context->memory->vm_info.segment.count.max)
+                {
+                    break;
+                }
+            }
+            shm_unlock(context);
+        }
     }
 
     if (context->config.lock_policy.trylock_interval_us > 0) {
@@ -444,11 +445,10 @@ int shmcache_init(struct shmcache_context *context,
             lock_policy.trylock_interval_us;
     }
     logDebug("file: "__FILE__", line: %d, "
-            "doing count: %d, done count: %d, hentry free count: %d, "
+            "doing count: %d, done count: %d, "
             "total entry count: %d", __LINE__,
             shm_object_pool_get_count(&context->value_allocator.doing),
             shm_object_pool_get_count(&context->value_allocator.done),
-            shm_object_pool_get_count(&context->hentry_allocator),
             MAX_KEYS_IN_SHM(context));
 
 #if 0
@@ -462,10 +462,10 @@ int shmcache_init(struct shmcache_context *context,
         int64_t bytes;
         int ii;
 
-        logInfo("list count: %d", shm_list_count(&context->list));
+        logInfo("list count: %d", shm_list_count(context));
         ii = 0;
         bytes = 0;
-        SHM_LIST_FOR_EACH(&context->list, current, list) {
+        SHM_LIST_FOR_EACH(context, current, list) {
 
             key.data = current->key;
             key.length = current->key_len;
@@ -519,7 +519,7 @@ int shmcache_init(struct shmcache_context *context,
     return result;
 }
 
-int64_t shmcache_parse_bytes(IniContext *iniContext,
+static int64_t shmcache_parse_bytes(IniContext *iniContext,
         const char *config_filename, const char *name, int *result)
 {
     char *value;
@@ -546,6 +546,23 @@ int64_t shmcache_parse_bytes(IniContext *iniContext,
     return size;
 }
 
+static int64_t shmcache_parse_bytes_with_default(IniContext *iniContext,
+        const char *config_filename, const char *name,
+        const int64_t def_value, int *result)
+{
+    char *value;
+    int64_t size;
+
+    value = iniGetStrValue(NULL, name, iniContext);
+    if (value == NULL) {
+        *result = 0;
+        return def_value;
+    }
+    if ((*result=parse_bytes(value, 1, &size)) != 0) {
+        return def_value;
+    }
+    return size;
+}
 
 int shmcache_load_config(struct shmcache_config *config,
 		const char *config_filename)
@@ -585,10 +602,23 @@ int shmcache_load_config(struct shmcache_config *config,
             break;
         }
 
+        config->min_memory = shmcache_parse_bytes_with_default(&iniContext,
+                config_filename, "min_memory", 0, &result);
+
         config->segment_size = shmcache_parse_bytes(&iniContext,
                 config_filename, "segment_size", &result);
         if (result != 0) {
             break;
+        }
+        if (config->max_memory / config->segment_size > 255) {
+            int64_t segment_size;
+            segment_size = config->max_memory / 255;
+            logWarning("file: "__FILE__", line: %d, "
+                    "config file: %s, segment_size: %"PRId64
+                    " is too small, set to %"PRId64,
+                    __LINE__, config_filename,
+                    config->segment_size, segment_size);
+            config->segment_size = segment_size;
         }
 
         config->max_key_count = iniGetIntValue(NULL, "max_key_count",
@@ -672,9 +702,9 @@ int shmcache_load_config(struct shmcache_config *config,
             break;
         }
         config->recycle_key_once = iniGetIntValue(NULL,
-                "recycle_key_once", &iniContext, 1);
+                "recycle_key_once", &iniContext, 0);
         if (config->recycle_key_once <= 0) {
-            config->recycle_key_once = 1;
+            config->recycle_key_once = -1;
         }
         load_log_level(&iniContext);
     } while (0);
@@ -707,6 +737,23 @@ int shmcache_init_from_file_ex(struct shmcache_context *context,
 
 void shmcache_destroy(struct shmcache_context *context)
 {
+    int index;
+
+    for (index=0; index < context->segments.values.count; index++) {
+        if (context->segments.values.items[index].base != NULL) {
+            shm_munmap(context->config.type,
+                    context->segments.values.items[index].base,
+                    context->segments.values.items[index].size);
+            context->segments.values.items[index].base = NULL;
+        }
+    }
+
+    if (context->segments.hashtable.base != NULL) {
+        shm_munmap(context->config.type,
+                context->segments.hashtable.base,
+                context->segments.hashtable.size);
+        context->segments.hashtable.base = NULL;
+    }
 }
 
 int shmcache_set_ex(struct shmcache_context *context,
@@ -765,6 +812,37 @@ int shmcache_delete(struct shmcache_context *context,
     if (result == 0) {
         context->memory->stats.hashtable.del.success++;
     }
+    shm_unlock(context);
+    return result;
+}
+
+int shmcache_set_ttl(struct shmcache_context *context,
+        const struct shmcache_key_info *key, const int ttl)
+{
+    int result;
+    if (ttl < 0) {
+        return EINVAL;
+    }
+    if ((result=shm_lock(context)) != 0) {
+        return result;
+    }
+    result = shm_ht_set_expires(context, key,
+            HT_CALC_EXPIRES(get_current_time(), ttl));
+    shm_unlock(context);
+    return result;
+}
+
+int shmcache_set_expires(struct shmcache_context *context,
+        const struct shmcache_key_info *key, const int expires)
+{
+    int result;
+    if (expires > 0 && expires < get_current_time()) {
+        return EINVAL;
+    }
+    if ((result=shm_lock(context)) != 0) {
+        return result;
+    }
+    result = shm_ht_set_expires(context, key, expires);
     shm_unlock(context);
     return result;
 }
@@ -840,23 +918,64 @@ int shmcache_remove_all(struct shmcache_context *context)
     return result;
 }
 
-void shmcache_stats(struct shmcache_context *context, struct shmcache_stats *stats)
+void shmcache_stats_ex(struct shmcache_context *context, struct shmcache_stats *stats,
+        const bool calc_hit_ratio)
 {
+    int64_t total_delta;
+    int64_t success_delta;
+
     stats->shm = context->memory->stats;
     stats->memory.max = context->segments.hashtable.size +
         context->memory->vm_info.segment.size *
         context->memory->vm_info.segment.count.max;
     stats->memory.used = context->memory->usage.used.common +
-        context->memory->usage.used.entry + context->memory->usage.used.value;
+        context->memory->usage.used.entry;
     stats->memory.usage = context->memory->usage;
     stats->hashtable.count = context->memory->hashtable.count;
     stats->hashtable.segment_size = context->segments.hashtable.size;
-    stats->max_key_count =  MAX_KEYS_IN_SHM(context);
+    stats->max_key_count = MAX_KEYS_IN_SHM(context);
+
+    if (calc_hit_ratio) {
+        if (!g_schedule_flag) {
+            g_current_time = time(NULL);
+        }
+        stats->hit.seconds = g_current_time - context->memory->stats.last.calc_time;
+        total_delta = context->memory->stats.hashtable.get.total
+            - context->memory->stats.last.get.total;
+        if (total_delta > 0) {
+            success_delta = context->memory->stats.hashtable.get.success
+                - context->memory->stats.last.get.success;
+            stats->hit.ratio = (double)success_delta / (double)total_delta;
+            if (stats->hit.seconds > 0) {
+                context->memory->stats.last.calc_time = g_current_time;
+                context->memory->stats.last.get.total =
+                    context->memory->stats.hashtable.get.total;
+                context->memory->stats.last.get.success =
+                    context->memory->stats.hashtable.get.success;
+                stats->hit.get_qps = (double)total_delta / (double)stats->hit.seconds;
+            } else {
+                stats->hit.get_qps = total_delta;
+            }
+        } else {
+            stats->hit.ratio = -1.00;
+            stats->hit.get_qps = 0.00;
+        }
+    } else {
+        stats->hit.seconds = 0;
+        stats->hit.ratio = -1.00;
+        stats->hit.get_qps = 0.00;
+    }
 }
 
 void shmcache_clear_stats(struct shmcache_context *context)
 {
+    shm_lock(context);
+
     memset(&context->memory->stats, 0, sizeof(context->memory->stats));
+    context->memory->stats.init_time =
+        context->memory->stats.last.calc_time = get_current_time();
+
+    shm_unlock(context);
 }
 
 const char *shmcache_get_serializer_label(const int serializer)

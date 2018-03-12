@@ -14,7 +14,7 @@
 
 #define SHMCACHE_MAJOR_VERSION  1
 #define SHMCACHE_MINOR_VERSION  0
-#define SHMCACHE_PATCH_VERSION  1
+#define SHMCACHE_PATCH_VERSION  5
 
 #define SHMCACHE_MAX_KEY_SIZE  64
 
@@ -38,6 +38,7 @@
 
 struct shmcache_config {
     char filename[MAX_PATH_SIZE];
+    int64_t min_memory;
     int64_t max_memory;
     int64_t segment_size;
     int max_key_count;
@@ -84,11 +85,8 @@ struct shm_segment_striping_pair {
 };
 
 struct shm_value {
-    int64_t offset; //value segment offset
-    int size;       //alloc size
     int length;     //value length
     int options;    //options for application
-    struct shm_segment_striping_pair index;
 };
 
 struct shm_list {
@@ -96,14 +94,29 @@ struct shm_list {
     int64_t next;
 };
 
+union shm_hentry_offset {
+    int64_t offset;
+    struct {
+        int index :16;
+        int64_t offset :48;
+    } segment;
+};
+
 struct shm_hash_entry {
     struct shm_list list;  //for recycle, must be first
 
-    char key[SHMCACHE_MAX_KEY_SIZE];
     int key_len;
     time_t expires;
     struct shm_value value;
+
+    struct {
+        int size;       //alloc size
+        struct shm_segment_striping_pair index;
+        int64_t offset; //value segment offset
+    } memory;
+
     int64_t ht_next;  //for hashtable
+    char key[0];
 };
 
 struct shm_ring_queue {
@@ -172,10 +185,11 @@ struct shm_counter {
     volatile int64_t success;
 };
 
-struct shm_recycle_counter {
+struct shm_recycle_stats {
     int64_t total;   //total count
     int64_t success; //succes count
     int64_t force;  //force recycle count (clear valid entries)
+    int64_t last_recycle_time;
 };
 
 struct shm_stats {
@@ -188,15 +202,14 @@ struct shm_stats {
     } hashtable;
 
     struct {
-
         struct {
             int64_t total;
             int64_t valid;
         } clear_ht_entry;  //clear for recycle
 
         struct {
-            struct shm_recycle_counter key;
-            struct shm_recycle_counter value_striping;
+            struct shm_recycle_stats key;
+            struct shm_recycle_stats value_striping;
         } recycle;
     } memory;
 
@@ -205,16 +218,24 @@ struct shm_stats {
         volatile int64_t retry;
         volatile int64_t detect_deadlock;
         volatile int64_t unlock_deadlock;
+        int64_t last_detect_deadlock_time;
+        int64_t last_unlock_deadlock_time;
     } lock;
 
-    char reserved[32];
+    //for calculate hit ratio
+    struct {
+        struct shm_counter get;
+        int64_t calc_time;
+    } last;
+
+    int64_t init_time;   //init unix timestamp
 };
 
 struct shm_memory_usage {
     int64_t alloced;
     struct {
-        int64_t common;
-        int64_t entry;
+        int64_t common; //first segment include hashtable
+        int64_t entry;  //whole entry include key and value
         int64_t key;
         int64_t value;
     } used;
@@ -223,10 +244,10 @@ struct shm_memory_usage {
 struct shm_memory_info {
     int size;    //sizeof(struct shm_memory_info)
     int status;
+    time_t init_time;   //init unix timestamp
     int max_key_count;
     struct shm_lock lock;
     struct shm_value_memory_info vm_info;  //value memory info
-    struct shm_object_pool_info hentry_obj_pool;  //hash entry object pool
     struct shm_value_allocator value_allocator;
     struct shm_stats stats;
     struct shm_memory_usage usage;
@@ -265,7 +286,6 @@ struct shmcache_value_allocator_context {
 };
 
 struct shmcache_list {
-    char *base;
     struct {
         struct shm_list *ptr;
         int64_t offset;
@@ -286,7 +306,6 @@ struct shmcache_context {
         } values;
     } segments;
 
-    struct shmcache_object_pool_context hentry_allocator;
     struct shmcache_value_allocator_context value_allocator;
     struct shmcache_list list;   //for value recycle
     bool create_segment;  //if check segment size
@@ -300,11 +319,18 @@ struct shmcache_stats {
         int count;  //key count
     } hashtable;
     int max_key_count;
+
     struct {
         int64_t max;
         int64_t used;
         struct shm_memory_usage usage;
     } memory;
+
+    struct {
+        double ratio;
+        double get_qps;
+        int seconds;
+    } hit;
 };
 
 #ifdef __cplusplus

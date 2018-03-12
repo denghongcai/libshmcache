@@ -4,6 +4,7 @@
 #include <time.h>
 #include "logger.h"
 #include "shared_func.h"
+#include "sched_thread.h"
 #include "shmcache.h"
 
 static void stats_output(struct shmcache_context *context);
@@ -73,7 +74,12 @@ static void stats_output(struct shmcache_context *context)
     struct shmcache_stats stats;
     int avg_key_len;
     int avg_value_len;
+    char total_ratio[32];
+    char ratio[32];
+    char rw_ratio[32];
+    char time_buff[32];
 
+    g_current_time = time(NULL);
     shmcache_stats(context, &stats);
     if (stats.hashtable.count > 0) {
         avg_key_len = stats.memory.usage.used.key / stats.hashtable.count;
@@ -82,6 +88,64 @@ static void stats_output(struct shmcache_context *context)
         avg_key_len = 0;
         avg_value_len = 0;
     }
+    if (stats.shm.hashtable.get.total > 0) {
+        sprintf(total_ratio, "%.2f%%", 100.00 * stats.shm.hashtable.get.success
+                / (double)stats.shm.hashtable.get.total);
+    } else {
+        total_ratio[0] = '-';
+        total_ratio[1] = '\0';
+    }
+    if (stats.hit.ratio >= 0.00) {
+        sprintf(ratio, "%.2f%%", stats.hit.ratio * 100.00);
+    } else {
+        ratio[0] = '-';
+        ratio[1] = '\0';
+    }
+    if (stats.shm.hashtable.set.total > 0) {
+        sprintf(rw_ratio, "%.2f / 1.00", stats.shm.hashtable.get.total
+                / (double)stats.shm.hashtable.set.total);
+    } else {
+        rw_ratio[0] = '-';
+        rw_ratio[1] = '\0';
+    }
+
+    printf("\ntimestamp info:\n");
+    printf("shm init time: %s\n", formatDatetime(context->memory->init_time,
+                "%Y-%m-%d %H:%M:%S", time_buff, sizeof(time_buff)));
+    if (context->memory->stats.hashtable.last_clear_time > 0) {
+        printf("last clear time: %s\n", formatDatetime(context->memory->stats.
+                    hashtable.last_clear_time, "%Y-%m-%d %H:%M:%S",
+                    time_buff, sizeof(time_buff)));
+    }
+    printf("stats begin time: %s\n", formatDatetime(context->memory->stats.
+                init_time, "%Y-%m-%d %H:%M:%S",
+                time_buff, sizeof(time_buff)));
+
+    if (context->memory->stats.memory.recycle.key.last_recycle_time > 0) {
+        printf("last recycle by key time: %s\n", formatDatetime(
+                    context->memory->stats.memory.recycle.key.
+                    last_recycle_time, "%Y-%m-%d %H:%M:%S",
+                    time_buff, sizeof(time_buff)));
+    }
+    if (context->memory->stats.memory.recycle.value_striping.last_recycle_time > 0) {
+        printf("last recycle by value time: %s\n", formatDatetime(
+                    context->memory->stats.memory.recycle.value_striping.
+                    last_recycle_time, "%Y-%m-%d %H:%M:%S",
+                    time_buff, sizeof(time_buff)));
+    }
+    if (context->memory->stats.lock.last_detect_deadlock_time > 0) {
+        printf("last detect deadlock time: %s\n", formatDatetime(
+                    context->memory->stats.lock.
+                    last_detect_deadlock_time, "%Y-%m-%d %H:%M:%S",
+                    time_buff, sizeof(time_buff)));
+    }
+    if (context->memory->stats.lock.last_unlock_deadlock_time > 0) {
+        printf("last unlock deadlock time: %s\n", formatDatetime(
+                    context->memory->stats.lock.
+                    last_unlock_deadlock_time, "%Y-%m-%d %H:%M:%S",
+                    time_buff, sizeof(time_buff)));
+    }
+    printf("\n");
 
     printf("\nhash table stats:\n");
     printf("max_key_count: %d\n"
@@ -95,7 +159,10 @@ static void stats_output(struct shmcache_context *context)
             "get.success_count: %"PRId64"\n"
             "del.total_count: %"PRId64"\n"
             "del.success_count: %"PRId64"\n"
-            "last_clear_time: %"PRId64"\n\n",
+            "get.qps: %.2f\n"
+            "hit ratio (last %d seconds): %s\n"
+            "total hit ratio (last %d seconds): %s\n"
+            "total RW ratio: %s\n\n",
             stats.max_key_count,
             stats.hashtable.count,
             (double)stats.hashtable.segment_size / (1024 * 1024),
@@ -107,7 +174,9 @@ static void stats_output(struct shmcache_context *context)
             stats.shm.hashtable.get.success,
             stats.shm.hashtable.del.total,
             stats.shm.hashtable.del.success,
-            (int64_t)stats.shm.hashtable.last_clear_time);
+            stats.hit.get_qps, stats.hit.seconds, ratio,
+            (int)(g_current_time - context->memory->stats.init_time),
+            total_ratio, rw_ratio);
 
     printf("\nmemory stats:\n");
     printf("total: %.03f MB\n"

@@ -1,8 +1,8 @@
 //shm_value_allocator.c
 
 #include <errno.h>
-#include <assert.h>
 #include "sched_thread.h"
+#include "shared_func.h"
 #include "shm_object_pool.h"
 #include "shm_striping_allocator.h"
 #include "shm_list.h"
@@ -10,33 +10,45 @@
 #include "shm_hashtable.h"
 #include "shm_value_allocator.h"
 
-static int shm_value_striping_alloc(struct shm_striping_allocator
-        *allocator, const int size, struct shm_value *value)
+static struct shm_hash_entry *shm_value_striping_alloc(
+        struct shmcache_context *context,
+        struct shm_striping_allocator *allocator, const int size)
 {
-    value->offset = shm_striping_allocator_alloc(allocator, size);
-    if (value->offset < 0) {
-        return ENOMEM;
+    int64_t offset;
+    char *base;
+    struct shm_hash_entry *entry;
+    offset = shm_striping_allocator_alloc(allocator, size);
+    if (offset < 0) {
+        return NULL;
     }
 
-    value->index = allocator->index;
-    value->size = size;
-    return 0;
+    base = shmopt_get_value_segment(context, allocator->index.segment);
+    if (base == NULL) {
+        return NULL;
+    }
+
+    entry = (struct shm_hash_entry *)(base + offset);
+    entry->memory.offset = offset;
+    entry->memory.index = allocator->index;
+    entry->memory.size = size;
+    return entry;
 }
 
-static int shm_value_allocator_do_alloc(struct shmcache_context *context,
-        const int size, struct shm_value *value)
+static struct shm_hash_entry *shm_value_allocator_do_alloc(struct shmcache_context *context,
+        const int size)
 {
     int64_t allocator_offset;
     int64_t removed_offset;
     struct shm_striping_allocator *allocator;
+    struct shm_hash_entry *entry;
 
     allocator_offset = shm_object_pool_first(&context->value_allocator.doing);
     while (allocator_offset > 0) {
         allocator = (struct shm_striping_allocator *)(context->segments.
                 hashtable.base + allocator_offset);
-        if (shm_value_striping_alloc(allocator, size, value) == 0) {
-            context->memory->usage.used.value += size;
-            return 0;
+        if ((entry=shm_value_striping_alloc(context, allocator, size)) != NULL) {
+            context->memory->usage.used.entry += size;
+            return entry;
         }
 
         if ((shm_striping_allocator_free_size(allocator) <= context->config.
@@ -46,7 +58,7 @@ static int shm_value_allocator_do_alloc(struct shmcache_context *context,
             removed_offset = shm_object_pool_remove(&context->value_allocator.doing);
             if (removed_offset == allocator_offset) {
                 allocator->in_which_pool = SHMCACHE_STRIPING_ALLOCATOR_POOL_DONE;
-                assert(shm_object_pool_push(&context->value_allocator.done, allocator_offset) == 0);
+                shm_object_pool_push(&context->value_allocator.done, allocator_offset);
             } else {
                 logCrit("file: "__FILE__", line: %d, "
                         "shm_object_pool_remove fail, "
@@ -58,7 +70,7 @@ static int shm_value_allocator_do_alloc(struct shmcache_context *context,
         allocator_offset = shm_object_pool_next(&context->value_allocator.doing);
     }
 
-    return ENOMEM;
+    return NULL;
 }
 
 
@@ -71,7 +83,7 @@ static int shm_value_allocator_do_recycle(struct shmcache_context *context,
         if (shm_object_pool_remove_by(&context->value_allocator.done,
                     allocator_offset) >= 0) {
             allocator->in_which_pool = SHMCACHE_STRIPING_ALLOCATOR_POOL_DOING;
-            assert(shm_object_pool_push(&context->value_allocator.doing, allocator_offset) == 0);
+            shm_object_pool_push(&context->value_allocator.doing, allocator_offset);
         } else {
             logCrit("file: "__FILE__", line: %d, "
                     "shm_object_pool_remove_by fail, "
@@ -84,9 +96,10 @@ static int shm_value_allocator_do_recycle(struct shmcache_context *context,
 }
 
 int shm_value_allocator_recycle(struct shmcache_context *context,
-        struct shm_recycle_counter *recycle_counter, const int recycle_keys_once)
+        struct shm_recycle_stats *recycle_stats, const int recycle_keys_once)
 {
     int64_t entry_offset;
+    int64_t start_time;
     struct shm_hash_entry *entry;
     struct shmcache_key_info key;
     int result;
@@ -98,11 +111,12 @@ int shm_value_allocator_recycle(struct shmcache_context *context,
 
     result = ENOMEM;
     clear_count = valid_count = 0;
-    g_current_time = time(NULL);
+    start_time = get_current_time_us();
+    g_current_time = start_time / 1000000;
     recycled = false;
-    while ((entry_offset=shm_list_first(&context->list)) > 0) {
-        entry = HT_ENTRY_PTR(context, entry_offset);
-        index = entry->value.index.striping;
+    while ((entry_offset=shm_list_first(context)) > 0) {
+        entry = shm_get_hentry_ptr(context, entry_offset);
+        index = entry->memory.index.striping;
         key.data = entry->key;
         key.length = entry->key_len;
         valid = HT_ENTRY_IS_VALID(entry, g_current_time);
@@ -131,8 +145,10 @@ int shm_value_allocator_recycle(struct shmcache_context *context,
             logInfo("file: "__FILE__", line: %d, "
                     "recycle #%d striping memory, "
                     "clear total entries: %d, "
-                    "clear valid entries: %d", __LINE__,
-                    index, clear_count, valid_count);
+                    "clear valid entries: %d, "
+                    "time used: %"PRId64" us", __LINE__,
+                    index, clear_count, valid_count,
+                    get_current_time_us() - start_time);
             result = 0;
             break;
         }
@@ -143,11 +159,12 @@ int shm_value_allocator_recycle(struct shmcache_context *context,
         context->memory->stats.memory.clear_ht_entry.valid += valid_count;
     }
 
-    recycle_counter->total++;
+    recycle_stats->last_recycle_time = g_current_time;
+    recycle_stats->total++;
     if (result == 0) {
-        recycle_counter->success++;
+        recycle_stats->success++;
         if (valid_count > 0) {
-            recycle_counter->force++;
+            recycle_stats->force++;
             if (context->config.va_policy.
                     sleep_us_when_recycle_valid_entries > 0)
             {
@@ -159,22 +176,27 @@ int shm_value_allocator_recycle(struct shmcache_context *context,
         logError("file: "__FILE__", line: %d, "
                 "unable to recycle memory, "
                 "clear total entries: %d, "
-                "cleared valid entries: %d",
-                __LINE__, clear_count, valid_count);
+                "cleared valid entries: %d, "
+                "time used: %"PRId64" us", __LINE__,
+                __LINE__, clear_count, valid_count,
+                get_current_time_us() - start_time);
     }
     return result;
 }
 
-int shm_value_allocator_alloc(struct shmcache_context *context,
-        const int size, struct shm_value *value)
+struct shm_hash_entry *shm_value_allocator_alloc(struct shmcache_context *context,
+        const int key_len, const int value_len)
 {
     int result;
+    int size;
     bool recycle;
     int64_t allocator_offset;
     struct shm_striping_allocator *allocator;
+    struct shm_hash_entry *entry;
 
-    if (shm_value_allocator_do_alloc(context, size, value) == 0) {
-        return 0;
+    size = sizeof(struct shm_hash_entry) + MEM_ALIGN(key_len) + MEM_ALIGN(value_len);
+    if ((entry=shm_value_allocator_do_alloc(context, size)) != NULL) {
+        return entry;
     }
 
     if (context->memory->vm_info.segment.count.current >=
@@ -200,31 +222,32 @@ int shm_value_allocator_alloc(struct shmcache_context *context,
         result = shmopt_create_value_segment(context);
     }
     if (result == 0) {
-        result = shm_value_allocator_do_alloc(context, size, value);
+        entry  = shm_value_allocator_do_alloc(context, size);
     }
-    if (result != 0) {
+    if (entry == NULL) {
         logError("file: "__FILE__", line: %d, "
                 "malloc %d bytes from shm fail", __LINE__, size);
     }
-    return result;
+    return entry;
 }
 
 int shm_value_allocator_free(struct shmcache_context *context,
-        struct shm_value *value, bool *recycled)
+        struct shm_hash_entry *entry, bool *recycled)
 {
     struct shm_striping_allocator *allocator;
     int64_t used;
 
-    allocator = context->value_allocator.allocators + value->index.striping;
-    used = shm_striping_allocator_free(allocator, value->size);
-    context->memory->usage.used.value -= value->size;
+    allocator = context->value_allocator.allocators + entry->memory.index.striping;
+    used = shm_striping_allocator_free(allocator, entry->memory.size);
+    context->memory->usage.used.entry -= entry->memory.size;
     if (used <= 0) {
         if (used < 0) {
             logError("file: "__FILE__", line: %d, "
                     "striping used memory: %"PRId64" < 0, "
                     "segment: %d, striping: %d, offset: %"PRId64", size: %d",
-                    __LINE__, used, value->index.segment,
-                    value->index.striping, value->offset, value->size);
+                    __LINE__, used, entry->memory.index.segment,
+                    entry->memory.index.striping, entry->memory.offset,
+                    entry->memory.size);
         }
         *recycled = true;
         shm_striping_allocator_reset(allocator);
@@ -233,4 +256,3 @@ int shm_value_allocator_free(struct shmcache_context *context,
 
     return 0;
 }
-

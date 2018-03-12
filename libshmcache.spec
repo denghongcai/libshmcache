@@ -3,9 +3,10 @@
 %define LibShmcacheConfig libshmcache-config
 %define LibShmcacheDevel  libshmcache-devel
 %define LibShmcacheDebuginfo  libshmcache-debuginfo
+%define CommitVersion %(echo $COMMIT_VERSION)
 
 Name: libshmcache
-Version: 1.0.1
+Version: 1.0.5
 Release: 1%{?dist}
 Summary: a high performance local share memory cache for multi processes
 License: LGPL
@@ -15,15 +16,16 @@ Source: http://github.com/happyfish100/libshmcache/%{name}-%{version}.tar.gz
 
 BuildRoot: %{_tmppath}/%{name}-%{version}-%{release}-root-%(%{__id_u} -n) 
 
-BuildRequires: libfastcommon-devel >= 1.0.33
+BuildRequires: libfastcommon-devel >= 1.0.35
 
 Requires: %__cp %__mv %__chmod %__grep %__mkdir %__install %__id
-Requires: libfastcommon >= 1.0.33
+Requires: libfastcommon >= 1.0.35
 
 %description
 libshmcache is a local share memory cache for multi processes.
 it is high performance because read is lockless.
 this project contains C library and PHP extension.
+commit version: %{CommitVersion}
 
 %package tool
 Summary: tool commands
@@ -31,12 +33,14 @@ Requires: %{name}%{?_isa} = %{version}-%{release}
 
 %description tool
 This package provides tool commands
+commit version: %{CommitVersion}
 
 %package config
 Summary: libshmcache config file
 
 %description config
 This package provides libshmcache config file
+commit version: %{CommitVersion}
 
 %package devel
 Summary: Development header file
@@ -44,8 +48,10 @@ Requires: %{name}%{?_isa} = %{version}-%{release}
 
 %description devel
 This package provides the header files of libshmcache
+commit version: %{CommitVersion}
 
 %prep
+
 %setup -q
 
 %build

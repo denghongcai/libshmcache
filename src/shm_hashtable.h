@@ -14,9 +14,6 @@
 #include "shm_list.h"
 #include "shm_value_allocator.h"
 
-#define HT_ENTRY_PTR(context, entry_offset) ((struct shm_hash_entry *) \
-    (context->segments.hashtable.base + entry_offset))
-
 #define HT_CALC_EXPIRES(current_time, ttl) \
     (ttl == SHMCACHE_NEVER_EXPIRED ? 0 : current_time + ttl)
 
@@ -60,6 +57,17 @@ return error no, 0 for success, != 0 for fail
 int shm_ht_set(struct shmcache_context *context,
         const struct shmcache_key_info *key,
         const struct shmcache_value_info *value);
+
+/**
+set expires
+parameters:
+	context: the context pointer
+    key: the key
+    value: the expires timestamp
+return error no, 0 for success, != 0 for fail
+*/
+int shm_ht_set_expires(struct shmcache_context *context,
+        const struct shmcache_key_info *key, const time_t expires);
 
 /**
 get value
